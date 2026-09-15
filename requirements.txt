@@ -1,2 +1,0 @@
-playwright==1.55.0
-pandas-market-calendars==5.1.1
