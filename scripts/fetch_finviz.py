@@ -11,6 +11,7 @@ from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://finviz.com/screener?v=111&f=exch_nasd,sh_price_u10,ta_change_u,ta_highlow20d_nh,ta_highlow50d_nh,ta_highlow52w_nh,ta_perf_dup&ft=4"
 OUTPUT = Path(os.environ.get("OUTPUT_FILE", "finviz_test_output.txt"))
+DEBUG = Path("finviz_debug.txt")
 FORCE_RUN = os.environ.get("FORCE_RUN", "0") == "1"
 UPDATE_PRODUCTION = os.environ.get("UPDATE_PRODUCTION", "0") == "1"
 
@@ -37,13 +38,16 @@ def with_r(url: str, r: int) -> str:
 
 
 def extract_total(text: str) -> int | None:
+    compact = re.sub(r"[\u00a0\s]+", " ", text)
     patterns = [
         r"\bTotal\s*:?\s*(\d+)\b",
-        r"\b1\s*-\s*\d+\s+of\s+(\d+)\b",
-        r"\bof\s+(\d+)\b",
+        r"\bResults?\s*:?\s*(\d+)\b",
+        r"\bShowing\s+\d+\s*-\s*\d+\s+of\s+(\d+)\b",
+        r"\b\d+\s*-\s*\d+\s+of\s+(\d+)\b",
+        r"\b\d+\s*/\s*(\d+)\b",
     ]
     for pat in patterns:
-        m = re.search(pat, text, flags=re.I)
+        m = re.search(pat, compact, flags=re.I)
         if m:
             return int(m.group(1))
     return None
@@ -53,8 +57,7 @@ def extract_tickers(page) -> list[str]:
     vals = page.locator('a[href*="quote.ashx?t="]').evaluate_all(
         "els => els.map(e => new URL(e.href).searchParams.get('t'))"
     )
-    out = []
-    seen = set()
+    out, seen = [], set()
     for v in vals:
         if not v:
             continue
@@ -65,6 +68,24 @@ def extract_tickers(page) -> list[str]:
     return out
 
 
+def save_debug(body: str, page) -> None:
+    snippets = []
+    for line in body.splitlines():
+        low = line.lower()
+        if any(k in low for k in ["total", "result", "showing", "screener", "#"]):
+            snippets.append(line)
+    DEBUG.write_text(
+        "=== RELEVANT TEXT LINES ===\n"
+        + "\n".join(snippets[:200])
+        + "\n\n=== BODY PREFIX ===\n"
+        + body[:12000]
+        + "\n\n=== URL ===\n"
+        + page.url
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def main() -> int:
     ok, why = scheduled_window_ok()
     print(f"Schedule check: {ok} ({why})")
@@ -72,8 +93,7 @@ def main() -> int:
         print("SKIP: outside the 70-minute window.")
         return 0
 
-    all_tickers: list[str] = []
-    seen = set()
+    all_tickers, seen = [], set()
     total = None
     pages = 0
 
@@ -82,10 +102,7 @@ def main() -> int:
         context = browser.new_context(
             viewport={"width": 1440, "height": 1200},
             locale="en-US",
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            ),
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
         )
         page = context.new_page()
 
@@ -93,26 +110,25 @@ def main() -> int:
         while True:
             url = BASE_URL if r == 1 else with_r(BASE_URL, r)
             print(f"Opening: {url}")
-            resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            resp = page.goto(url, wait_until="networkidle", timeout=60000)
             if resp is None or resp.status >= 400:
                 raise RuntimeError(f"HTTP problem at r={r}: {None if resp is None else resp.status}")
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(1500)
             body = page.locator("body").inner_text(timeout=15000)
+            save_debug(body, page)
             lowered = body.lower()
             if any(x in lowered for x in ["captcha", "access denied", "temporarily blocked", "verify you are human"]):
                 raise RuntimeError("Finviz blocking/challenge detected")
-
-            if total is None:
-                total = extract_total(body)
-                print(f"Reported total: {total}")
-                if total is None:
-                    raise RuntimeError("Could not determine total result count from Finviz page")
 
             tickers = extract_tickers(page)
             pages += 1
             print(f"Page {pages}: extracted {len(tickers)} ticker candidates")
             if not tickers:
                 raise RuntimeError(f"No tickers extracted from page r={r}")
+
+            if total is None:
+                total = extract_total(body)
+                print(f"Reported total: {total}")
 
             before = len(all_tickers)
             for t in tickers:
@@ -122,14 +138,24 @@ def main() -> int:
             added = len(all_tickers) - before
             print(f"Page {pages}: added {added} unique tickers; cumulative={len(all_tickers)}")
 
-            if len(all_tickers) >= total:
+            if total is not None and len(all_tickers) >= total:
                 break
+
+            # If Finviz did not expose a readable total, continue until the next page
+            # yields no new ticker symbols. This lets diagnostics reveal the current markup.
+            if total is None and pages > 1 and added == 0:
+                break
+
             r += 20
             if pages > 100:
                 raise RuntimeError("Pagination safety limit exceeded")
 
         browser.close()
 
+    if total is None:
+        raise RuntimeError(
+            f"Could not determine Finviz reported total. Extracted {len(all_tickers)} unique tickers across {pages} page(s); see finviz_debug.txt"
+        )
     if total != len(all_tickers):
         raise RuntimeError(f"Validation failed: Finviz total={total}, unique tickers={len(all_tickers)}")
 
@@ -141,7 +167,7 @@ def main() -> int:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
-            f.write(f"## Finviz test result\n\n")
+            f.write("## Finviz test result\n\n")
             f.write(f"- Reported results: **{total}**\n")
             f.write(f"- Unique tickers: **{len(all_tickers)}**\n")
             f.write(f"- Pages read: **{pages}**\n")
