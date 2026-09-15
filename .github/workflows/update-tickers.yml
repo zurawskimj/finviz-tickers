@@ -1,0 +1,63 @@
+name: Update Finviz tickers
+
+on:
+  schedule:
+    # NASDAQ regular close: 16:00 America/New_York -> target 14:50 ET.
+    # NASDAQ early close:   13:00 America/New_York -> target 11:50 ET.
+    # GitHub cron is UTC, so we cover both EST and EDT. The Python script
+    # checks the NASDAQ calendar and exits without changes on all wrong runs.
+    - cron: "50 15,16,18,19 * * 1-5"
+  workflow_dispatch:
+  push:
+    paths:
+      - "finviz_tickers.py"
+      - "requirements.txt"
+      - ".github/workflows/update-tickers.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finviz-ticker-update
+  cancel-in-progress: false
+
+jobs:
+  update-tickers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Fetch all Finviz tickers
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
+            python finviz_tickers.py --force
+          else
+            python finviz_tickers.py
+          fi
+
+      - name: Commit ticki.txt when changed
+        shell: bash
+        run: |
+          if git diff --quiet -- ticki.txt; then
+            echo "ticki.txt did not change. Nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ticki.txt
+          git commit -m "Update Finviz tickers $(date -u +%Y-%m-%d)"
+          git push
