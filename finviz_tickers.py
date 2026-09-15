@@ -114,7 +114,7 @@ def request_page(session: requests.Session, start_row: int) -> str:
                 raise RuntimeError("Response does not look like a Finviz page")
 
             return html
-        except Exception as exc:  # network / HTTP / anti-bot response
+        except Exception as exc:
             last_error = exc
             if attempt < 3:
                 wait_seconds = attempt * 5
@@ -127,6 +127,15 @@ def request_page(session: requests.Session, start_row: int) -> str:
     raise RuntimeError(f"Could not download Finviz page r={start_row}: {last_error}")
 
 
+def normalize_ticker(value: str | None) -> str | None:
+    if not value:
+        return None
+    ticker = value.strip().upper()
+    if not TICKER_RE.fullmatch(ticker):
+        return None
+    return ticker
+
+
 def ticker_from_href(href: str) -> str | None:
     try:
         values = parse_qs(urlsplit(href).query).get("t")
@@ -135,39 +144,40 @@ def ticker_from_href(href: str) -> str | None:
 
     if not values:
         return None
+    return normalize_ticker(values[0])
 
-    ticker = values[0].strip().upper()
-    if not TICKER_RE.fullmatch(ticker):
-        return None
-    return ticker
+
+def add_unique(target: list[str], ticker: str | None) -> None:
+    if ticker and ticker not in target:
+        target.append(ticker)
 
 
 def extract_tickers(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     tickers: list[str] = []
 
-    # Prefer actual screener table rows (first cell is normally the row number).
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"], recursive=False)
-        if not cells:
+    # Current Finviz markup (2026): the screener ticker cell carries the clean
+    # symbol in data-boxover-ticker. This avoids the hidden logo letter that can
+    # otherwise duplicate the first character when reading visible cell text.
+    for element in soup.select("[data-boxover-ticker]"):
+        add_unique(tickers, normalize_ticker(element.get("data-boxover-ticker")))
+
+    if tickers:
+        return tickers
+
+    # Fallback: Finviz historically used tr[valign="top"] screener rows.
+    for row in soup.select('tr[valign="top"]'):
+        tokens = [text.strip() for text in row.stripped_strings if text.strip()]
+        if len(tokens) < 2 or not tokens[0].isdigit():
             continue
+        add_unique(tickers, normalize_ticker(tokens[1]))
 
-        first_cell = cells[0].get_text(" ", strip=True)
-        if not re.fullmatch(r"\d+", first_cell):
-            continue
+    if tickers:
+        return tickers
 
-        for link in row.select('a[href*="quote.ashx?t="]'):
-            ticker = ticker_from_href(link.get("href", ""))
-            if ticker and ticker not in tickers:
-                tickers.append(ticker)
-                break
-
-    # Fallback for future Finviz markup changes.
-    if not tickers:
-        for link in soup.select('a[href*="quote.ashx?t="]'):
-            ticker = ticker_from_href(link.get("href", ""))
-            if ticker and ticker not in tickers:
-                tickers.append(ticker)
+    # Legacy fallback: ticker links containing quote.ashx?t=SYMBOL.
+    for link in soup.select('a[href*="quote.ashx?t="]'):
+        add_unique(tickers, ticker_from_href(link.get("href", "")))
 
     return tickers
 
@@ -192,11 +202,11 @@ def fetch_all_tickers() -> list[str]:
     first_page = extract_tickers(first_html)
 
     print(f"Finviz reports {total} total result(s).")
-    print(f"Page 1: {len(first_page)} ticker(s).")
+    print(f"Page 1: {len(first_page)} ticker(s): {', '.join(first_page)}")
 
     if total == 0:
         if first_page:
-            raise RuntimeError("Finviz reports 0 results but ticker links were found")
+            raise RuntimeError("Finviz reports 0 results but ticker symbols were found")
         return []
 
     if not first_page:
@@ -204,21 +214,22 @@ def fetch_all_tickers() -> list[str]:
 
     all_tickers: list[str] = []
     for ticker in first_page:
-        if ticker not in all_tickers:
-            all_tickers.append(ticker)
+        add_unique(all_tickers, ticker)
 
     for start_row in range(PAGE_SIZE + 1, total + 1, PAGE_SIZE):
         time.sleep(2)
         html = request_page(session, start_row)
         page_tickers = extract_tickers(html)
-        print(f"Page r={start_row}: {len(page_tickers)} ticker(s).")
+        print(
+            f"Page r={start_row}: {len(page_tickers)} ticker(s): "
+            f"{', '.join(page_tickers)}"
+        )
 
         if not page_tickers:
             raise RuntimeError(f"No tickers parsed from expected Finviz page r={start_row}")
 
         for ticker in page_tickers:
-            if ticker not in all_tickers:
-                all_tickers.append(ticker)
+            add_unique(all_tickers, ticker)
 
     if len(all_tickers) != total:
         raise RuntimeError(
