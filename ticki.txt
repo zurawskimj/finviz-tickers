@@ -1,2 +1,4 @@
+HPK
+OPRT
+SOTK
 VAI
-VRA
