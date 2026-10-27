@@ -137,14 +137,21 @@ def normalize_ticker(value: str | None) -> str | None:
 
 
 def ticker_from_href(href: str) -> str | None:
+    """Ticker z linku: ?t=XYZ albo /quote/XYZ, /stock/XYZ."""
+    if not href:
+        return None
     try:
-        values = parse_qs(urlsplit(href).query).get("t")
+        parts = urlsplit(href)
     except Exception:
         return None
-
-    if not values:
-        return None
-    return normalize_ticker(values[0])
+    if "quote" in parts.path.lower() or "stock" in parts.path.lower():
+        values = parse_qs(parts.query).get("t")
+        if values:
+            return normalize_ticker(values[0])
+        m = re.search(r"/(?:quote|stock)s?/([A-Za-z0-9.\-]{1,16})/?$", parts.path)
+        if m:
+            return normalize_ticker(m.group(1))
+    return None
 
 
 def add_unique(target: list[str], ticker: str | None) -> None:
@@ -152,34 +159,90 @@ def add_unique(target: list[str], ticker: str | None) -> None:
         target.append(ticker)
 
 
-def extract_tickers(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    tickers: list[str] = []
+JSON_TICKER_RE = re.compile(r'"(?:ticker|symbol)"\s*:\s*"([A-Za-z0-9.\-]{1,16})"')
 
-    # Current Finviz markup (2026): the screener ticker cell carries the clean
-    # symbol in data-boxover-ticker. This avoids the hidden logo letter that can
-    # otherwise duplicate the first character when reading visible cell text.
-    for element in soup.select("[data-boxover-ticker]"):
-        add_unique(tickers, normalize_ticker(element.get("data-boxover-ticker")))
 
-    if tickers:
-        return tickers
+def _strategy_boxover(soup, html):
+    out: list[str] = []
+    for el in soup.select("[data-boxover-ticker]"):
+        add_unique(out, normalize_ticker(el.get("data-boxover-ticker")))
+    return out
 
-    # Fallback: Finviz historically used tr[valign="top"] screener rows.
-    for row in soup.select('tr[valign="top"]'):
-        tokens = [text.strip() for text in row.stripped_strings if text.strip()]
-        if len(tokens) < 2 or not tokens[0].isdigit():
+
+def _strategy_data_attr(soup, html):
+    out: list[str] = []
+    for el in soup.find_all(True):
+        for name, value in el.attrs.items():
+            if name.startswith("data-") and ("ticker" in name or "symbol" in name):
+                if isinstance(value, str):
+                    add_unique(out, normalize_ticker(value))
+    return out
+
+
+def _strategy_links(soup, html):
+    out: list[str] = []
+    for link in soup.select("a[href]"):
+        add_unique(out, ticker_from_href(link.get("href", "")))
+    return out
+
+
+def _strategy_rows(soup, html):
+    """Wiersze tabeli: 1. komorka = numer, 2. komorka = ticker."""
+    out: list[str] = []
+    for row in soup.select("tr"):
+        cells = row.find_all("td", recursive=False)
+        if len(cells) < 3:
             continue
-        add_unique(tickers, normalize_ticker(tokens[1]))
+        if not cells[0].get_text(strip=True).isdigit():
+            continue
+        cell = cells[1]
+        link = cell.find("a")
+        t = ticker_from_href(link.get("href", "")) if link else None
+        if not t:
+            # ostatni fragment tekstu - pomija ewentualna litere z logo
+            texts = [x.strip() for x in cell.stripped_strings if x.strip()]
+            t = normalize_ticker(texts[-1]) if texts else None
+        add_unique(out, t)
+    return out
 
-    if tickers:
-        return tickers
 
-    # Legacy fallback: ticker links containing quote.ashx?t=SYMBOL.
-    for link in soup.select('a[href*="quote.ashx?t="]'):
-        add_unique(tickers, ticker_from_href(link.get("href", "")))
+def _strategy_json(soup, html):
+    out: list[str] = []
+    for m in JSON_TICKER_RE.finditer(html):
+        add_unique(out, normalize_ticker(m.group(1)))
+    return out
 
-    return tickers
+
+STRATEGIES = (
+    ("data-boxover-ticker", _strategy_boxover),
+    ("atrybut data-*ticker/symbol", _strategy_data_attr),
+    ("wiersze tabeli", _strategy_rows),
+    ("linki do notowan", _strategy_links),
+    ("JSON w stronie", _strategy_json),
+)
+
+
+def extract_tickers(html: str, expected: int) -> list[str]:
+    """
+    Probuje kilku sposobow odczytu tickerow. Przyjmuje TYLKO taki wynik,
+    ktorego liczba tickerow zgadza sie z liczba wynikow podana przez Finviz
+    dla tej strony - dzieki temu zmiana wygladu strony nie zapisze smieci.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    report = []
+    for name, fn in STRATEGIES:
+        try:
+            found = fn(soup, html)
+        except Exception as exc:
+            found = []
+            report.append(f"{name}: blad {exc}")
+            continue
+        report.append(f"{name}: {len(found)}")
+        if len(found) == expected:
+            print(f"  odczyt tickerow sposobem: {name}")
+            return found
+    print(f"  Zaden sposob nie dal {expected} tickerow -> " + "; ".join(report))
+    return []
 
 
 def extract_total(html: str) -> int:
@@ -194,12 +257,16 @@ def extract_total(html: str) -> int:
     raise RuntimeError("Could not determine the Finviz 'Total' result count; refusing to overwrite ticki.txt")
 
 
+LAST_HTML: dict[int, str] = {}
+
+
 def fetch_all_tickers() -> list[str]:
     session = requests.Session()
 
     first_html = request_page(session, 1)
+    LAST_HTML[1] = first_html
     total = extract_total(first_html)
-    first_page = extract_tickers(first_html)
+    first_page = extract_tickers(first_html, min(PAGE_SIZE, total)) if total else []
 
     print(f"Finviz reports {total} total result(s).")
     print(f"Page 1: {len(first_page)} ticker(s): {', '.join(first_page)}")
@@ -219,7 +286,8 @@ def fetch_all_tickers() -> list[str]:
     for start_row in range(PAGE_SIZE + 1, total + 1, PAGE_SIZE):
         time.sleep(2)
         html = request_page(session, start_row)
-        page_tickers = extract_tickers(html)
+        LAST_HTML[start_row] = html
+        page_tickers = extract_tickers(html, min(PAGE_SIZE, total - start_row + 1))
         print(
             f"Page r={start_row}: {len(page_tickers)} ticker(s): "
             f"{', '.join(page_tickers)}"
@@ -274,6 +342,10 @@ def main() -> int:
         return 0
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        # zapis strony do diagnostyki (workflow wrzuca go jako artefakt)
+        for row, html in LAST_HTML.items():
+            Path(f"finviz_debug_r{row}.html").write_text(html, encoding="utf-8")
+            print(f"Debug: zapisano finviz_debug_r{row}.html")
         return 1
 
 
