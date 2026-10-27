@@ -48,6 +48,15 @@ jobs:
             python finviz_tickers.py
           fi
 
+      - name: Upload Finviz page for debugging (only on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finviz-debug
+          path: finviz_debug_*.html
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Commit ticki.txt when changed
         shell: bash
         run: |
